@@ -106,10 +106,25 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+
+# Modified device detection for MPS support
+if device == 'cuda' and torch.cuda.is_available():
+    device_type = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device_type = 'mps'
+    device = 'mps'
+else:
+    device_type = 'cpu'
+    device = 'cpu'
+
 # note: float16 data type will automatically use a GradScaler
+# MPS currently has limited float16 support, so we might need to adjust
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# For MPS, we might want to use float32 if float16 is not well supported
+if device_type == 'mps':
+    ctx = nullcontext()  # MPS may not fully support autocast yet
+else:
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -123,10 +138,13 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    # Move tensors to device
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
+        # For MPS and CPU, directly move to device
         x, y = x.to(device), y.to(device)
     return x, y
 
@@ -193,7 +211,8 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# Note: GradScaler has limited support on MPS
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16' and device_type == 'cuda'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -205,7 +224,11 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    # torch.compile is not available on MPS
+    if device_type != 'mps':
+        model = torch.compile(model) # requires PyTorch 2.0
+    else:
+        print("Skipping compilation as it's not supported on MPS")
 
 # wrap model into DDP container
 if ddp:
@@ -302,14 +325,26 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        # Only use scaler if we're on CUDA and using float16
+        if dtype == 'float16' and device_type == 'cuda':
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+            
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        # Unscale if we're using scaler
+        if dtype == 'float16' and device_type == 'cuda':
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    if dtype == 'float16' and device_type == 'cuda':
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+        
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
